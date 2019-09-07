@@ -1,6 +1,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "spi_sdcard_driver.h"
 #include "spi_sdcard_driver_config.h"
+#include "spi_sdcard_crc7.h"
 
 /* Private types -------------------------------------------------------------*/
 typedef enum card_type_e {
@@ -38,11 +39,14 @@ typedef enum card_type_e {
 #define SPI_SPEED_NO_INIT_HZ        (400000U)
 #define SPI_SPEED_MAX_HZ            (25000000U)
 
+#define CMD_CRC_OFFSET              5
+#define CRC7_SHIFT_MASK(crc7)       ((crc7) << 1U | 1U)
+
 /* Private variables ---------------------------------------------------------*/
 static card_type_t _card_type;
 static spisd_interface_t const*_io = NULL;
 
-static uint8_t _send_command(uint8_t cmd, uint32_t arg, uint8_t crc) {
+static uint8_t _send_command(uint8_t cmd, uint32_t arg) {
 
     uint8_t response = 0xFF;
 
@@ -50,7 +54,9 @@ static uint8_t _send_command(uint8_t cmd, uint32_t arg, uint8_t crc) {
     _io->wr_rd_byte(DUMMY_BYTE);
     _io->select();
 
-    uint8_t packet[] = {cmd | 0x40, arg >> 24, arg >> 16, arg >> 8, arg, crc};
+    uint8_t packet[] = {cmd | 0x40, arg >> 24, arg >> 16, arg >> 8, arg, 0};
+    packet[CMD_CRC_OFFSET] = CRC7_SHIFT_MASK(crc7(packet, CMD_CRC_OFFSET));
+
     _io->write(packet, sizeof(packet));
 
     /* Wait response, quit till timeout */
@@ -69,13 +75,14 @@ static uint8_t _send_command(uint8_t cmd, uint32_t arg, uint8_t crc) {
     return response;
 }
 
-static uint8_t _send_command_recv_response(uint8_t cmd, uint32_t arg, uint8_t crc, uint8_t* data, size_t size) {
+static uint8_t _send_command_recv_response(uint8_t cmd, uint32_t arg, uint8_t* data, size_t size) {
 
     /* Dummy byte and chip enable */
     _io->wr_rd_byte(DUMMY_BYTE);
     _io->select();
 
-    uint8_t packet[] = {cmd | 0x40, arg >> 24, arg >> 16, arg >> 8, arg, crc};
+    uint8_t packet[] = {cmd | 0x40, arg >> 24, arg >> 16, arg >> 8, arg, 0};
+    packet[CMD_CRC_OFFSET] = CRC7_SHIFT_MASK(crc7(packet, CMD_CRC_OFFSET));
     _io->write(packet, sizeof(packet));
 
     uint8_t response = DUMMY_BYTE;
@@ -98,14 +105,14 @@ static uint8_t _send_command_recv_response(uint8_t cmd, uint32_t arg, uint8_t cr
     return response;
 }
 
-static uint8_t _send_command_hold(uint8_t cmd, uint32_t arg, uint8_t crc) {
+static uint8_t _send_command_hold(uint8_t cmd, uint32_t arg) {
 
     /* Dummy byte and chip enable */
     _io->wr_rd_byte(DUMMY_BYTE);
     _io->select();
 
-
-    uint8_t packet[] = {cmd | 0x40, arg >> 24, arg >> 16, arg >> 8, arg, crc};
+    uint8_t packet[] = {cmd | 0x40, arg >> 24, arg >> 16, arg >> 8, arg, 0};
+    packet[CMD_CRC_OFFSET] = CRC7_SHIFT_MASK(crc7(packet, CMD_CRC_OFFSET));
     _io->write(packet, sizeof(packet));
 
 
@@ -160,6 +167,10 @@ spisd_result_t spisd_init(spisd_interface_t const *const io) {
         return SPISD_RESULT_NO_CARD;
     }
 
+#if CRC7_RAM_TABLE == 1
+    crc7_generate_table();
+#endif //CRC7_RAM_TABLE == 1
+
     _io->relese();
     _io->set_speed(SPI_SPEED_NO_INIT_HZ);
 
@@ -172,7 +183,7 @@ spisd_result_t spisd_init(spisd_interface_t const *const io) {
     uint8_t response = 0;
 
     do {
-        response = _send_command(CMD0, 0, 0x95);
+        response = _send_command(CMD0, 0);
         timeout--;
     } while ((response != SPISD_R1_IDLE_FLAG) && timeout > 0 );
 
@@ -182,7 +193,7 @@ spisd_result_t spisd_init(spisd_interface_t const *const io) {
     }
 
     uint8_t buff[4];
-    response = _send_command_recv_response(CMD8, 0x1AA, 0x87, buff, sizeof(buff));
+    response = _send_command_recv_response(CMD8, 0x1AA, buff, sizeof(buff));
 
     if (response == SPISD_R1_IDLE_FLAG) {
 
@@ -190,14 +201,14 @@ spisd_result_t spisd_init(spisd_interface_t const *const io) {
         if (buff[2] == 0x01 && buff[3] == 0xAA) {
 
             for (uint32_t i = 0; i < 0xFFF; i++) {
-                response = _send_command(CMD55, 0, 0);            /* should be return 0x01 */
+                response = _send_command(CMD55, 0);            /* should be return 0x01 */
 
                 if (response != 0x01) {
                     SPISD_LOG("Send CMD55 should return 0x01, response=0x%02x\r\n", response);
                     return SPISD_RESULT_TIMEOUT;
                 }
 
-                response = _send_command(ACMD41, 0x40000000, 0);    /* should be return 0x00 */
+                response = _send_command(ACMD41, 0x40000000);    /* should be return 0x00 */
 
                 if (response == 0x00) {
                     break;
@@ -210,7 +221,7 @@ spisd_result_t spisd_init(spisd_interface_t const *const io) {
             }
 
             /* Read OCR by CMD58 */
-            response = _send_command_recv_response(CMD58, 0, 0, buff, sizeof(buff));
+            response = _send_command_recv_response(CMD58, 0, buff, sizeof(buff));
 
             if (response != 0x00) {
                 SPISD_LOG("Send CMD58 should return 0x00, response=0x%02x\r\n", response);
@@ -235,14 +246,14 @@ spisd_result_t spisd_init(spisd_interface_t const *const io) {
         /* SD1.0/MMC start initialize */
         /* Send CMD55+ACMD41, No-response is a MMC card, otherwise is a SD1.0 card */
         for (uint32_t i = 0; i < 0xFFF; i++) {
-            response = _send_command(CMD55, 0, 0);
+            response = _send_command(CMD55, 0);
 
             if (response != 0x01) {
                 SPISD_LOG("Send CMD55 should return 0x01, response=0x%02x\r\n", response);
                 return SPISD_RESULT_TIMEOUT;
             }
 
-            response = _send_command(ACMD41, 0, 0);
+            response = _send_command(ACMD41, 0);
 
             if (response == 0x00) {
                 break;
@@ -252,7 +263,7 @@ spisd_result_t spisd_init(spisd_interface_t const *const io) {
         /* MMC card initialize start */
         if (response != 0x00) {
             for (uint32_t i = 0; i < 0xFFF; i++) {
-                response = _send_command(CMD1, 0, 0);
+                response = _send_command(CMD1, 0);
 
                 if (response == 0x00) {
                     break;
@@ -282,7 +293,7 @@ spisd_result_t spisd_init(spisd_interface_t const *const io) {
         }
 
         /* Set the block size */
-        response = _send_command(CMD16, BLOCK_SIZE, 0xFF);
+        response = _send_command(CMD16, BLOCK_SIZE);
 
         if (response != 0x00) {
             SPISD_LOG("Send CMD16 should return 0x00, response=0x%02x\r\n", response);
@@ -302,7 +313,7 @@ int spisd_get_card_info(spisd_info_t *cardinfo) {
     _io->wr_rd_byte(DUMMY_BYTE);
 
     /* Send CMD9, Read CSD */
-    uint8_t response = _send_command(CMD9, 0, 0xFF);
+    uint8_t response = _send_command(CMD9, 0);
 
     if (response != 0x00) {
         return response;
@@ -392,7 +403,7 @@ int spisd_get_card_info(spisd_info_t *cardinfo) {
     cardinfo->block_size = BLOCK_SIZE;
 
     /* Send CMD10, Read CID */
-    response = _send_command(CMD10, 0, 0xFF);
+    response = _send_command(CMD10, 0);
 
     if (response != 0x00) {
         return response;
@@ -457,7 +468,7 @@ spisd_result_t spisd_read_block(uint32_t sector, uint8_t *buffer) {
 
     spisd_result_t ret = SPISD_RESULT_ERROR;
 
-    if (_send_command_hold(CMD17, sector, 0) == 0x00) {
+    if (_send_command_hold(CMD17, sector) == 0x00) {
 
         ret = _read_buffer(buffer, BLOCK_SIZE);
     }
@@ -476,7 +487,7 @@ spisd_result_t spisd_write_block(uint32_t sector, const uint8_t *buffer) {
         sector = sector << 9;
     }
 
-    if (_send_command(CMD24, sector, 0) != 0x00) {
+    if (_send_command(CMD24, sector) != 0x00) {
         return ret;
     }
 
@@ -523,7 +534,7 @@ spisd_result_t spisd_read_multi_block_begin(uint32_t sector) {
         sector = sector << 9;
     }
 
-    if (_send_command(CMD18, sector, 0) != 0x00) {
+    if (_send_command(CMD18, sector) != 0x00) {
         return SPISD_RESULT_ERROR;
     }
 
@@ -541,7 +552,7 @@ spisd_result_t spisd_read_multi_block_read(uint8_t *buffer, uint32_t num_sectors
 
         if (ret != SPISD_RESULT_OK) {
             /* Send stop data transmit command - CMD12    */
-            _send_command(CMD12, 0, 0);
+            _send_command(CMD12, 0);
             return SPISD_RESULT_ERROR;
         }
     }
@@ -555,7 +566,7 @@ spisd_result_t spisd_read_multi_block_read(uint8_t *buffer, uint32_t num_sectors
 spisd_result_t spisd_read_multi_block_end(void) {
 
     /* Send stop data transmit command - CMD12 */
-    _send_command(CMD12, 0, 0);
+    _send_command(CMD12, 0);
 
     return SPISD_RESULT_OK;
 }
@@ -569,11 +580,11 @@ spisd_result_t spisd_write_multi_block(uint32_t sector, uint8_t const *buffer, u
 
     /* Send command ACMD23 berfore multi write if is not a MMC card */
     if (_card_type != CARD_TYPE_MMC) {
-        _send_command(CMD55, 0, 0x00);
-        _send_command(ACMD23, num_sectors, 0x00);
+        _send_command(CMD55, 0);
+        _send_command(ACMD23, num_sectors);
     }
 
-    if (_send_command(CMD25, sector, 0) != 0x00) {
+    if (_send_command(CMD25, sector) != 0x00) {
         return SPISD_RESULT_ERROR;
     }
 
